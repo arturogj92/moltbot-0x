@@ -22,6 +22,31 @@ import { downloadInboundMedia } from "./media.js";
 import { createWebSendApi } from "./send-api.js";
 import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
 
+
+// Cache for recent audio messages by sender+chat
+const recentAudioCache = new Map<string, { path: string; type: string; timestamp: number }>();
+const AUDIO_CACHE_TTL_MS = 30000; // 30 seconds
+
+function cleanupAudioCache() {
+  const now = Date.now();
+  for (const [key, value] of recentAudioCache.entries()) {
+    if (now - value.timestamp > AUDIO_CACHE_TTL_MS) {
+      recentAudioCache.delete(key);
+    }
+  }
+}
+
+export function getRecentAudio(chatId: string, senderId: string): { path: string; type: string } | undefined {
+  cleanupAudioCache();
+  const key = `${chatId}:${senderId}`;
+  const cached = recentAudioCache.get(key);
+  if (cached && Date.now() - cached.timestamp < AUDIO_CACHE_TTL_MS) {
+    recentAudioCache.delete(key); // consume it
+    return { path: cached.path, type: cached.type };
+  }
+  return undefined;
+}
+
 export async function monitorWebInbox(options: {
   verbose: boolean;
   accountId: string;
@@ -76,6 +101,10 @@ export async function monitorWebInbox(options: {
     },
     shouldDebounce: options.shouldDebounce,
     onFlush: async (entries) => {
+      console.log('[DEBUG-DEBOUNCER] entries count:', entries.length);
+      for (const e of entries) {
+        console.log('[DEBUG-DEBOUNCER] entry body:', e.body?.substring(0, 50), 'mediaPath:', e.mediaPath);
+      }
       const last = entries.at(-1);
       if (!last) return;
       if (entries.length === 1) {
@@ -90,10 +119,14 @@ export async function monitorWebInbox(options: {
         .map((entry) => entry.body)
         .filter(Boolean)
         .join("\n");
+      // Preserve mediaPath/mediaType from any entry that has it
+      const mediaEntry = entries.find(e => e.mediaPath);
       const combinedMessage: WebInboundMessage = {
         ...last,
         body: combinedBody,
         mentionedJids: mentioned.size > 0 ? Array.from(mentioned) : undefined,
+        mediaPath: mediaEntry?.mediaPath ?? last.mediaPath,
+        mediaType: mediaEntry?.mediaType ?? last.mediaType,
       };
       await options.onMessage(combinedMessage);
     },
@@ -241,6 +274,12 @@ export async function monitorWebInbox(options: {
           );
           mediaPath = saved.path;
           mediaType = inboundMedia.mimetype;
+          // Cache audio for later association with mention messages
+          if (mediaType?.startsWith('audio/')) {
+            const cacheKey = `${remoteJid}:${participantJid || from}`;
+            recentAudioCache.set(cacheKey, { path: mediaPath, type: mediaType, timestamp: Date.now() });
+            console.log('[DEBUG-AUDIO-CACHE] Cached audio:', cacheKey, mediaPath);
+          }
         }
       } catch (err) {
         logVerbose(`Inbound media download failed: ${String(err)}`);
